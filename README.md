@@ -482,16 +482,6 @@ make prove-cluster        # upstream calls (fleet) : 2
 
 A shared cache alone is not sufficient. That is the argument for the lock.
 
-### Image details
-
-Multi-stage. The runtime layer is `distroless/static` — no shell, no package
-manager, non-root (uid 65532), static binary. Since the image has no `curl`, the
-server ships its own probe (`server -healthcheck`) rather than the image carrying
-tools it would otherwise never need; Compose gates startup on that probe.
-
-The build stage installs `gcc` and `musl-dev`, which the race detector needs —
-the Alpine Go image carries no C toolchain, and `go test -race` fails without them.
-
 ### Configuration in containers
 
 Compose sets these; everything else comes from the baked-in `config.yaml`:
