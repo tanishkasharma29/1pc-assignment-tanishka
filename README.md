@@ -603,17 +603,3 @@ strict cost bound deliberately; the budget remains the real ceiling.
 keyspace combinatorial and the bound degrades to "whatever the budget allows"
 instead of a provable number. The mechanism supports adding them with validated
 ranges if needed — this is a chosen default, not a limitation.
-
-### Out of scope
-
-Named so the omissions read as decisions rather than gaps:
-
-- **Prometheus `/metrics`** — counters exist and appear on `/readyz` and in every
-  request log line (`cache=hit|miss`). Exposing them in Prometheus format would be
-  the first thing to add.
-- **Cache invalidation / purge API** — the data is immutable; TTL is the only
-  lifecycle.
-- **Stale-while-revalidate** — meaningless for immutable data.
-- **Write methods** — not required, and the middleware declines to cache non-`GET`
-  regardless of policy.
-- **Authentication** — none specified; rate limiting is keyed on client address.
