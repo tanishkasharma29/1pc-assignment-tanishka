@@ -276,26 +276,6 @@ proxy reads its real allowance and refuses to spend the last of it.
 
 ---
 
-## Cost model
-
-The reachable keyspace is finite **by construction**:
-
-| Route | Validation | Distinct keys |
-|---|---|---|
-| `/posts/{id}` | integer, `1 ≤ id ≤ max_resource_id` | 100 |
-| `/todos/{id}` | integer, `1 ≤ id ≤ max_resource_id` | 200 |
-| `/posts` | `userId` only, `1 ≤ userId ≤ max_user_id` | 11 |
-| `/todos` | `userId`, `completed` | 33 |
-| | **Total** | **344** |
-
-**Steady state: 300 upstream calls for items, ever** (items never expire).
-Collections cost 44 calls per TTL window, or 344 total if collections are also
-declared immutable — one config line.
-
-Anything outside this space is a `400` and costs nothing.
-
----
-
 ## Architecture
 
 ```
