@@ -1,0 +1,61 @@
+# The app and its Redis. Two containers.
+#
+#   make docker-up      build and start
+#   make docker-prove   fire 200 concurrent cold requests, count upstream calls
+#   make docker-down    tear down
+#
+# What Redis is doing here: with a single replica, singleflight already
+# guarantees one upstream call per key, so Redis is not what makes that true.
+# It is here as the shared entry store and lock that a second replica would need,
+# and keeping it wired means scaling out is a compose change rather than a code
+# change. See docker-compose.cluster.yml for that.
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Persistence is deliberately off. Everything here is a cache entry that can
+    # be re-derived, and an fsync on the request path would be pure latency.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [proxy-net]
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: typecode-proxy:latest
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: docker
+      SERVER_ADDR: ":8080"
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      CACHE_BACKEND: redis
+      REDIS_ADDR: redis:6379
+      REDIS_LOCK_ENABLED: "true"
+      # The proof fires 200 requests at once from a single address; the
+      # per-client limiter would otherwise shape the burst being measured.
+      RATE_LIMIT_ENABLED: "false"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [proxy-net]
+    restart: unless-stopped
+
+networks:
+  proxy-net:
+    driver: bridge

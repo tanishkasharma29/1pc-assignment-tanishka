@@ -1,0 +1,14 @@
+# Keep the build context small and free of anything that could leak into an image.
+.git
+.gitignore
+*.md
+!deploy/*.md
+bin/
+dist/
+coverage.out
+coverage.html
+.idea/
+.vscode/
+.DS_Store
+Dockerfile
+docker-compose.yml

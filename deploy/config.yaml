@@ -1,0 +1,141 @@
+# Runtime configuration for the caching proxy.
+#
+# Everything here has a working default in internal/config, so this file is
+# optional: the service runs correctly with no file and no environment at all.
+# What lives here is the per-route cache policy table, which is hierarchical and
+# reads badly as flat environment variables. Individual scalars can still be
+# overridden per-container by the environment (see README).
+
+env: development
+
+server:
+  addr: ":8080"
+  read_header_timeout: "5s"
+  read_timeout: "15s"
+  write_timeout: "25s"
+  idle_timeout: "60s"
+  shutdown_timeout: "15s"
+  # Must cover the worst-case retry sequence:
+  #   timeout x max_attempts + retry_max_delay x (max_attempts - 1)
+  #   = 3s x 3 + 2s x 2 = 15s
+  # Anything shorter expires mid-retry and makes the retry policy meaningless.
+  request_timeout: "15s"
+  max_header_bytes: 1048576
+
+log:
+  level: "info"
+  format: "json"
+
+upstream:
+  base_url: "https://jsonplaceholder.typicode.com"
+  timeout: "3s"            # per attempt, not for the whole retry sequence
+  max_attempts: 3
+  retry_base_delay: "100ms"
+  retry_max_delay: "2s"
+  max_response_bytes: 2097152
+  max_idle_conns: 100
+  max_idle_conns_per_host: 50
+
+  # The only true ceiling on spend. A per-client rate limit constrains one
+  # caller; this constrains all of them together.
+  budget:
+    enabled: true
+    max_calls: 800
+    window: "1h"
+    # The upstream publishes x-ratelimit-limit: 1000 and x-ratelimit-remaining
+    # on every response. We read those and refuse to spend the last of the
+    # allowance, leaving headroom for traffic we cannot foresee.
+    reserve_remaining: 25
+
+# Accepted input ranges. These are a cost control, not just hygiene: every value
+# we accept is a cache key a caller can mint, and the upstream charges for
+# /posts/abc and /posts/999999 just as readily as for a real id.
+# Set above the observed dataset (ids 1-100 and 1-200, users 1-10) so modest
+# upstream growth does not break us.
+validation:
+  max_resource_id: 1000
+  max_user_id: 100
+
+cache:
+  enabled: true
+  # "memory" needs no infrastructure and is correct for a single instance.
+  # "redis" adds cross-instance coordination; see README.
+  backend: "memory"
+  max_body_bytes: 1048576
+  debug_headers: false
+
+  # Allowlist. Anything absent is neither stored nor replayed, which keeps
+  # per-request headers (Date, Set-Cookie) and hop-by-hop headers out of entries
+  # that may later be served to a different client.
+  store_headers:
+    - "Content-Type"
+    - "Content-Language"
+    - "ETag"
+    - "Last-Modified"
+    - "Vary"
+
+  memory:
+    max_entries: 4096
+    # Bounded separately on purpose. Keys that yield 404s are chosen by the
+    # caller and unbounded in number; sharing one LRU would let a loop over
+    # nonexistent ids evict the real dataset.
+    max_negative_entries: 1024
+    max_bytes: 67108864
+    janitor_interval: "1m"
+
+  redis:
+    addr: "localhost:6379"
+    password: ""
+    db: 0
+    key_prefix: "typecode:"
+    dial_timeout: "2s"
+    read_timeout: "1s"
+    write_timeout: "1s"
+    pool_size: 20
+    lock:
+      enabled: true
+      ttl: "10s"           # bounds how long a crashed leader blocks the fleet
+      wait_timeout: "5s"   # then fail open: a slow peer must not become an outage
+      poll_interval: "25ms"
+
+  # Per-route policy. This is the "configurable per route" requirement: the same
+  # generic middleware caches each route according to its own entry here, and a
+  # route with enabled: false passes straight through.
+  routes:
+    posts_item:
+      enabled: true
+      ttl: "0s"            # never expires: the upstream guarantees immutability
+      negative_ttl: "5m"   # 0 here would mean "do not cache 404s at all"
+
+    todos_item:
+      enabled: true
+      ttl: "0s"
+      negative_ttl: "5m"
+
+    posts_list:
+      enabled: true
+      # Finite, unlike items: a collection is not immutable in general, since a
+      # new post would change it. One line to change if that assumption differs.
+      ttl: "10m"
+      negative_ttl: "1m"
+      allow_query: ["userId"]
+      # The upstream honours these; we decline them. Stripping them instead
+      # would hand back 100 items to a client that asked for 5.
+      deny_query: ["_limit", "_start", "_page", "_sort", "_order"]
+
+    todos_list:
+      enabled: true
+      ttl: "10m"
+      negative_ttl: "1m"
+      allow_query: ["userId", "completed"]
+      deny_query: ["_limit", "_start", "_page", "_sort", "_order"]
+
+rate_limit:
+  enabled: true
+  requests_per_second: 50
+  burst: 100
+  max_clients: 10000
+  client_ttl: "10m"
+  # Only enable behind a proxy you control: X-Forwarded-For is trivially forged,
+  # and trusting it lets any client present a fresh identity per request.
+  trust_proxy_headers: false

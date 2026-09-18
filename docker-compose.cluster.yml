@@ -1,0 +1,57 @@
+# Optional overlay: adds a second replica and an nginx load balancer, turning the
+# two-container setup into a four-container one.
+#
+# This demonstrates a claim the single-replica setup cannot: that a cold key
+# costs one upstream call for the whole fleet rather than one per process.
+# singleflight coordinates goroutines inside a process and nothing across
+# processes, so the Redis lock only does observable work once there are two.
+#
+#   make docker-up-cluster
+#   make prove-cluster
+#
+# The base file's app keeps :8080, so the balancer takes :8000. Nothing here
+# overrides a value from the base file, which keeps this compatible with older
+# Compose versions that lack the !override tag.
+
+services:
+  app:
+    environment:
+      RATE_LIMIT_TRUST_PROXY: "true"
+
+  app-2:
+    image: typecode-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8080"
+    environment:
+      APP_ENV: docker
+      SERVER_ADDR: ":8080"
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      CACHE_BACKEND: redis
+      REDIS_ADDR: redis:6379
+      REDIS_LOCK_ENABLED: "true"
+      RATE_LIMIT_ENABLED: "false"
+      RATE_LIMIT_TRUST_PROXY: "true"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [proxy-net]
+    restart: unless-stopped
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8000:8080"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    # nginx resolves its upstream names when the config loads, so starting it
+    # before the replicas are up is a race.
+    depends_on:
+      app:
+        condition: service_healthy
+      app-2:
+        condition: service_healthy
+    networks: [proxy-net]
