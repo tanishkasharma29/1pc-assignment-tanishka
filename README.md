@@ -23,7 +23,6 @@ make prove   # fire 200 concurrent cold requests, count the upstream calls
 - [Quick start](#quick-start)
 - [API](#api)
 - [How the guarantee is achieved](#how-the-guarantee-is-achieved)
-- [Cost model](#cost-model)
 - [Architecture](#architecture)
 - [Configuration](#configuration)
 - [Running with Docker](#running-with-docker)
