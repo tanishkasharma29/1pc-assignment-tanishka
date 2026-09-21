@@ -190,6 +190,98 @@ func TestTimeoutIsReportedDistinctly(t *testing.T) {
 	}
 }
 
+func TestRetriesAttemptTimeout(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			// Outlast this attempt's deadline, but not the caller's patience.
+			time.Sleep(300 * time.Millisecond)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":1}`))
+	}))
+	defer srv.Close()
+ 
+	c := testClient(t, srv.URL, func(u *config.Upstream) {
+		u.Timeout = config.Duration(50 * time.Millisecond)
+		u.MaxAttempts = 3
+	})
+ 
+	resp, err := c.Get(context.Background(), "/posts/1", nil)
+	if err != nil {
+		t.Fatalf("Get: a slow first attempt must be retried, not surfaced: %v", err)
+	}
+	if resp.Status != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.Status)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts = %d, want 2 (one timed out, one succeeded)", got)
+	}
+ }
+ 
+ // TestDoesNotRetryCallerCancellation is the other half of the same distinction.
+ func TestDoesNotRetryCallerCancellation(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int64
+	started := make(chan struct{}, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		started <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+ 
+	// The per-attempt deadline is generous on purpose: the only thing that ends
+	// this call is the caller, so any retry is the client ignoring that.
+	c := testClient(t, srv.URL, func(u *config.Upstream) {
+		u.Timeout = config.Duration(5 * time.Second)
+		u.MaxAttempts = 3
+	})
+ 
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+ 
+	if _, err := c.Get(ctx, "/posts/1", nil); err == nil {
+		t.Fatal("expected an error once the caller cancelled")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1: nobody is waiting, so nothing should be spent", got)
+	}
+ }
+ 
+ // TestExhaustsAttemptsWhenEveryTryTimesOut pins the price of retrying timeouts:
+ // a persistently slow upstream is now billed for max_attempts calls, not one.
+ func TestExhaustsAttemptsWhenEveryTryTimesOut(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+ 
+	c := testClient(t, srv.URL, func(u *config.Upstream) {
+		u.Timeout = config.Duration(30 * time.Millisecond)
+		u.MaxAttempts = 3
+	})
+ 
+	_, err := c.Get(context.Background(), "/posts/1", nil)
+	var appErr *apperror.Error
+	if !errors.As(err, &appErr) || appErr.Status != http.StatusGatewayTimeout {
+		t.Fatalf("error = %v; want a 504-mapped apperror after the sequence is exhausted", err)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("attempts = %d, want 3", got)
+	}
+	if got := c.Calls(); got != 3 {
+		t.Errorf("Calls() = %d, want 3: every dispatched attempt is billable", got)
+	}
+ }
+
 // TestBudgetStopsSpending proves the only true ceiling on cost.
 func TestBudgetStopsSpending(t *testing.T) {
 	t.Parallel()

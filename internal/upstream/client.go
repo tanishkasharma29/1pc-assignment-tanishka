@@ -29,6 +29,17 @@ import (
 // spend.
 var ErrBudgetExhausted = errors.New("upstream call budget exhausted")
 
+// errAttemptTimeout marks a failure caused by one attempt's own deadline rather
+// than by the caller giving up.
+//
+// The distinction cannot be recovered from the error alone: an attempt context
+// is derived from the caller's, so both expiries surface as
+// context.DeadlineExceeded. Only do, which holds both, can tell them apart —
+// and it must, because they call for opposite responses. An attempt that ran
+// out of time is the transient slowness retries exist for; a caller that gave
+// up means nobody is waiting, and further attempts would only spend budget.
+var errAttemptTimeout = errors.New("upstream attempt deadline exceeded")
+
 // Response is a completed upstream exchange. A non-2xx Status is a normal
 // outcome, not an error.
 type Response struct {
@@ -161,6 +172,13 @@ func (c *Client) do(ctx context.Context, rawURL string) (*Response, error) {
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
+
+		// Attribute the deadline here, where both contexts are still in scope.
+		// An expired attempt under a live caller is retryable; an expired caller
+		// is not. Past this point the two are indistinguishable.
+		if attemptCtx.Err() != nil && ctx.Err() == nil {
+            return nil, fmt.Errorf("upstream request: %w: %w", errAttemptTimeout, err)
+        }
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -218,6 +236,13 @@ func retryableStatus(status int) bool {
 }
 
 func retryableErr(err error) bool {
+ 	// This attempt's own deadline fired while the caller was still waiting —
+	// precisely the transient slowness retries exist for. Checked first, because
+	// the error also carries context.DeadlineExceeded, which the clause below
+	// would otherwise read as the caller having given up.
+	if errors.Is(err, errAttemptTimeout) {
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
