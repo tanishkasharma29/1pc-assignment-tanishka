@@ -108,6 +108,20 @@ func TestTwoInstancesMakeOneUpstreamCall(t *testing.T) {
 	if stats := instanceB.Stats(); stats.PeerFills != 1 {
 		t.Errorf("instance B peer_fills = %d, want 1: it should have been served by A's fetch", stats.PeerFills)
 	}
+
+	// B elected its own singleflight leader, but that leader never reached the
+	// upstream: it waited on A's lock and read A's entry. Reporting MISS here
+	// would claim a fetch per replica for a fleet that paid once, and would make
+	// scripts/prove.sh count two fetches in the cluster proof.
+	if got := recB.Header().Get("X-Cache"); got != StatusHit {
+		t.Errorf("instance B: X-Cache = %q, want %q: a peer fill costs nothing upstream", got, StatusHit)
+	}
+	if stats := instanceB.Stats(); stats.Misses != 0 {
+		t.Errorf("instance B misses = %d, want 0: it performed no fetch", stats.Misses)
+	}
+	if got := recA.Header().Get("X-Cache"); got != StatusMiss {
+		t.Errorf("instance A: X-Cache = %q, want %q: it is the replica that paid", got, StatusMiss)
+	}
 }
 
 // TestWithoutTheLockEachInstancePays is the contrast that justifies the lock.
@@ -183,3 +197,69 @@ func TestSecondInstanceReadsTheSharedEntry(t *testing.T) {
 		t.Fatalf("upstream called %d times; want 1", got)
 	}
 }
+
+// TestClusterBurstReportsOneMiss is the in-process equivalent of
+// `make prove-cluster`: a burst of concurrent cold requests round-robined across
+// two replicas.
+//
+// The docker proof asserts on the X-Cache headers, because that is what a
+// reviewer can read without trusting our counters. This pins the same property
+// here, where it runs in CI: across the fleet exactly one response is labelled
+// MISS, and it is the one that paid. A replica that waits on a peer's lock and
+// is then served the peer's entry is a HIT — it elected a local singleflight
+// leader, but a leader that never reached the upstream.
+func TestClusterBurstReportsOneMiss(t *testing.T) {
+	const requests = 200
+ 
+	server := miniredis.RunT(t)
+	replicas := []*Middleware{
+		newInstance(t, server.Addr(), true),
+		newInstance(t, server.Addr(), true),
+	}
+ 
+	var calls atomic.Int64
+	// A slow upstream is the point: it holds the window open in which both
+	// replicas are cold, which is the condition the lock exists to handle.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	})
+ 
+	handlers := make([]http.Handler, len(replicas))
+	for i, replica := range replicas {
+		handlers[i] = replica.For(immutablePolicy())(handler)
+	}
+ 
+	statuses := make([]string, requests)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+ 		go func(i int) {
+		defer wg.Done()
+ 		rec := httptest.NewRecorder()
+ 			<-start
+ 			handlers[i%len(handlers)].ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/posts/1", nil))
+ 			statuses[i] = rec.Header().Get("X-Cache")
+ 		}(i)
+ 	}
+ 	close(start)
+	wg.Wait()
+ 
+	counts := map[string]int{}
+ 	for _, status := range statuses {
+ 		counts[status]++
+ 	}
+ 
+	if counts[StatusMiss] != 1 {
+ 		t.Errorf("X-Cache: MISS = %d across the fleet, want exactly 1 (%v)", counts[StatusMiss], counts)
+ 	}
+ 	if got := calls.Load(); got != 1 {
+ 		t.Errorf("upstream called %d times, want 1", got)
+ 	}
+ 	if counts[StatusHit]+counts[StatusCoalesced]+counts[StatusMiss] != requests {
+ 		t.Errorf("unexpected X-Cache values: %v", counts)
+ 	}
+ }

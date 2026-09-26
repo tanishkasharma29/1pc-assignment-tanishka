@@ -171,10 +171,12 @@ func (m *Middleware) serve(w http.ResponseWriter, r *http.Request, next http.Han
 	// leader's goroutine, so a follower's copy stays false. The `shared` return
 	// value cannot be used for this: it is true for the leader as well whenever
 	// anyone waited on it.
-	var leader bool
+	var leader, fetched bool
 	result, _, _ := m.group.Do(key.hash, func() (any, error) {
 		leader = true
-		return m.fill(r, next, policy, key), nil
+		entry, didFetch := m.fill(r, next, policy, key)
+		fetched = didFetch
+		return entry, nil
 	})
 	entry, _ := result.(*cache.Entry)
 	if entry == nil {
@@ -187,8 +189,19 @@ func (m *Middleware) serve(w http.ResponseWriter, r *http.Request, next http.Han
 	}
 
 	if leader {
-		m.misses.Add(1)
-		m.writeEntry(w, r, entry, StatusMiss, key)
+		// Only a flight that actually reached the upstream is a miss. A leader
+		// whose flight resolved from the shared cache — a peer had already
+		// stored the entry, or stored it while we waited on the lock — cost
+		// nothing upstream, and labelling it MISS would report one fetch per
+		// replica for what the fleet paid for once. peer_fills in /readyz keeps
+		// the distinction between a local and a cross-instance hit.
+		if fetched {
+			m.misses.Add(1)
+			m.writeEntry(w, r, entry, StatusMiss, key)
+			return
+		}
+		m.hits.Add(1)
+		m.writeEntry(w, r, entry, StatusHit, key)
 		return
 	}
 
@@ -213,7 +226,11 @@ func (m *Middleware) serve(w http.ResponseWriter, r *http.Request, next http.Han
 // Everything here runs exactly once per key per flight, and the ordering within
 // it is the guarantee: the entry is written and acknowledged before this returns,
 // and returning is what releases the waiting requests.
-func (m *Middleware) fill(r *http.Request, next http.Handler, policy Policy, key cacheKey) *cache.Entry {
+//
+// The second return value reports whether this flight actually dispatched the
+// upstream call. It is false when the entry came from the shared cache instead,
+// which is the normal outcome on every replica but the one that paid.
+func (m *Middleware) fill(r *http.Request, next http.Handler, policy Policy, key cacheKey) (*cache.Entry, bool) {
 	// Detach from the originating request's cancellation.
 	//
 	// If the client that happened to be elected leader disconnects, its request
@@ -223,13 +240,13 @@ func (m *Middleware) fill(r *http.Request, next http.Handler, policy Policy, key
 	// — while dropping the cancellation that does not belong to the followers.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), m.opts.FetchTimeout)
 	defer cancel()
-
+ 
 	// Re-check now that we hold the flight. Another leader may have completed
 	// between our miss and our election.
 	if entry, ok, err := m.cache.Get(ctx, key.hash); err == nil && ok {
-		return entry
+		return entry, false
 	}
-
+ 
 	// Cross-instance coordination. Within this process singleflight has already
 	// done its job; this extends the same guarantee across replicas.
 	if release, acquired, err := m.locker.Acquire(ctx, key.hash); err != nil {
@@ -242,7 +259,7 @@ func (m *Middleware) fill(r *http.Request, next http.Handler, policy Policy, key
 	} else if entry, ok := m.waitForPeer(ctx, key); ok {
 		// Another instance fetched it. That is one upstream call for the fleet.
 		m.peerFills.Add(1)
-		return entry
+		return entry, false
 	} else {
 		// The peer did not deliver in time. Proceed rather than fail: a slow or
 		// dead leader must not turn into an outage.
@@ -252,12 +269,12 @@ func (m *Middleware) fill(r *http.Request, next http.Handler, policy Policy, key
 	rec := newRecorder(m.opts.MaxBodyBytes)
 	next.ServeHTTP(rec, r.WithContext(ctx))
 	entry := rec.entry(m.opts.StoreHeaders)
-
+ 
 	ttl, cacheable := policy.ttlFor(entry.Status)
 	if !cacheable || !rec.cacheable() {
-		return entry
+		return entry, true
 	}
-
+ 
 	// The critical ordering. Set is synchronous and its acknowledgement is
 	// awaited, and both happen before this function returns. Moving this after
 	// the return — or making it asynchronous — would let a released follower, or
@@ -266,10 +283,10 @@ func (m *Middleware) fill(r *http.Request, next http.Handler, policy Policy, key
 		m.storeErrors.Add(1)
 		m.log.WarnContext(ctx, "cache store failed; response will not be reused",
 			slog.String("key", key.readable), slog.String("error", err.Error()))
-		return entry
+		return entry, true
 	}
 	m.stored.Add(1)
-	return entry
+	return entry, true
 }
 
 // waitForPeer polls the shared cache for a fill by another instance, giving up

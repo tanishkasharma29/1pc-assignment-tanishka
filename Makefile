@@ -37,8 +37,7 @@ cover:
 
 ## bench-proof: run only the tests that prove the single-call guarantee
 bench-proof:
-	go test -race -count=1 -v -run 'SingleFlight|BeforeResponseIsFlushed|LeaderCancellation|TwoInstances|WithoutTheLock' ./internal/cachemw/
-
+	go test -race -count=1 -v -run 'SingleFlight|BeforeResponseIsFlushed|LeaderCancellation|TwoInstances|WithoutTheLock|ClusterBurst' ./internal/cachemw/
 ## fmt: format all Go source
 fmt:
 	gofmt -w -s .
@@ -125,9 +124,8 @@ docker-up-cluster:
 	@echo "  replica app-2 : http://localhost:8082"
 
 ## prove-cluster: proof across the cluster, summing upstream calls from both replicas
-prove-cluster:
-	@REPLICAS="http://localhost:8080 http://localhost:8082" \
-		./scripts/prove.sh http://localhost:8000 200
+ prove-cluster:
+	@./scripts/prove.sh http://localhost:8000 200 "http://localhost:8080 http://localhost:8082"
 
 ## docker-down-cluster: tear down the 4-container setup
 docker-down-cluster:
